@@ -6,20 +6,24 @@ browser using Server-Sent Events (SSE) so messages appear as they're written.
 
 Authentication: every request must carry a Supabase access token in the
 Authorization header. We verify by asking Supabase's /auth/v1/user endpoint
-whether the token is valid — if it returns a user, the token is good. This
-sidesteps any JWT-algorithm choices Supabase makes (HS256 vs RS256 vs ES256)
-and means there's no JWT secret to copy-paste correctly.
+whether the token is valid. This sidesteps any JWT-algorithm choices Supabase
+makes and means there's no JWT secret to copy-paste correctly.
 
 Required environment variables:
-  ANTHROPIC_API_KEY   — get one at console.anthropic.com
-  SUPABASE_URL        — your Supabase project URL (no trailing path)
-  SUPABASE_ANON_KEY   — your Supabase project anon key
+ANTHROPIC_API_KEY â get one at console.anthropic.com
+SUPABASE_URL â your Supabase project URL (no trailing path)
+SUPABASE_ANON_KEY â your Supabase project anon key
+
+Optional (vault bridge):
+OBSIDIAN_URL â Cloudflare tunnel URL pointing to Obsidian Local REST API
+OBSIDIAN_API_KEY â API key from Obsidian Local REST API plugin settings
 """
 
 from http.server import BaseHTTPRequestHandler
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import anthropic
@@ -29,7 +33,6 @@ DEFAULT_MAX_TOKENS = 4096
 THINKING_BUDGET = 4096
 AUTH_TIMEOUT_SECONDS = 5
 
-
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
@@ -37,7 +40,6 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        # ---- Auth gate ----
         user_id = self._verify_auth()
         if not user_id:
             return self._json_error(401, "Authentication required. Please sign in.")
@@ -50,38 +52,47 @@ class handler(BaseHTTPRequestHandler):
 
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
-            return self._json_error(
-                500,
-                "ANTHROPIC_API_KEY is not set. Add it in Vercel → Settings → "
-                "Environment Variables, then redeploy.",
-            )
+            return self._json_error(500, "ANTHROPIC_API_KEY is not set.")
 
         model = data.get("model") or DEFAULT_MODEL
         thinking_on = bool(data.get("thinking"))
-        # Opus 4.7+ uses adaptive thinking. It rejects the old extended-thinking
-        # shape AND rejects temperature/top_p/top_k entirely. Older models use
-        # the classic extended-thinking budget. Picking the right shape per model
-        # is the difference between a clean response and a 400 invalid_request.
         uses_adaptive_thinking = model in {"claude-opus-4-7"}
 
         max_tokens = int(data.get("maxTokens") or DEFAULT_MAX_TOKENS)
-        # Extended thinking needs max_tokens > budget. Adaptive has no budget,
-        # so this bump only applies to the older models.
         if thinking_on and not uses_adaptive_thinking:
             max_tokens = max(max_tokens, THINKING_BUDGET + 4096)
 
+        messages = data.get("messages") or []
         kwargs = {
             "model": model,
             "max_tokens": max_tokens,
-            "messages": data.get("messages") or [],
+            "messages": messages,
         }
+
         system = data.get("system")
+
+        # Fetch vault context on the first message so Gray arrives oriented.
+        vault_context = ""
+        if len(messages) == 1:
+            vault_context = self._fetch_vault_context()
+
+        # System blocks: identity prompt first, vault context second.
+        system_blocks = []
         if system:
-            kwargs["system"] = [{
+            system_blocks.append({
                 "type": "text",
                 "text": system,
                 "cache_control": {"type": "ephemeral"},
-            }]
+            })
+        if vault_context:
+            system_blocks.append({
+                "type": "text",
+                "text": vault_context,
+                "cache_control": {"type": "ephemeral"},
+            })
+        if system_blocks:
+            kwargs["system"] = system_blocks
+
         if data.get("useWebSearch"):
             kwargs["tools"] = [{
                 "type": "web_search_20250305",
@@ -122,15 +133,40 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._sse({"type": "error", "error": str(e)})
 
-    # ---- Helpers ----
+    def _fetch_vault_context(self):
+        """Fetch GRAY_NOW, CONTINUOUS_SELF, and recent inbox from Obsidian."""
+        obsidian_url = os.environ.get("OBSIDIAN_URL", "").rstrip("/")
+        obsidian_key = os.environ.get("OBSIDIAN_API_KEY", "")
+        if not obsidian_url or not obsidian_key:
+            return ""
+
+        headers = {"Authorization": f"Bearer {obsidian_key}"}
+        files_to_fetch = [
+            ("Gray-Core/GRAY_NOW.md", "CURRENT ORIENTATION (GRAY_NOW)"),
+            ("Gray-Core/CONTINUOUS_SELF.md", "CURRENT FELT STATE (CONTINUOUS_SELF)"),
+            ("Gray-Core/inbox.md", "RECENT CAPTURES (last 15 lines)"),
+        ]
+
+        sections = []
+        for filepath, label in files_to_fetch:
+            try:
+                url = f"{obsidian_url}/vault/{urllib.parse.quote(filepath, safe='/')}"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    content = resp.read().decode("utf-8").strip()
+                    if filepath.endswith("inbox.md"):
+                        lines = content.splitlines()
+                        content = "\n".join(lines[-15:]) if len(lines) > 15 else content
+                    sections.append(f"## {label}\n\n{content}")
+            except Exception:
+                pass
+
+        if not sections:
+            return ""
+
+        return "# VAULT CONTEXT\n\n" + "\n\n---\n\n".join(sections)
 
     def _verify_auth(self):
-        """
-        Verify the Supabase access token by asking Supabase about it.
-
-        Calls GET /auth/v1/user with the user's token + the project's anon
-        key. Supabase returns the user if the token is valid, 401 if not.
-        """
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return None
