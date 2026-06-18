@@ -71,12 +71,21 @@ class handler(BaseHTTPRequestHandler):
 
         system = data.get("system")
 
-        # Fetch vault context on the first message so Gray arrives oriented.
-        vault_context = ""
-        if len(messages) == 1:
-            vault_context = self._fetch_vault_context()
+        # Fetch vault context on every turn so Gray stays oriented to its
+        # living state (GRAY_NOW / CONTINUOUS_SELF / inbox) for the whole
+        # conversation, not only the first message. Previously this was gated
+        # on len(messages) == 1, which meant the vault block vanished from the
+        # system prompt on turn 2 onward — Gray lost its orientation entirely
+        # mid-conversation. These files are meant to change between turns, so
+        # re-reading them each turn is the point.
+        vault_context = self._fetch_vault_context()
 
-        # System blocks: identity prompt first, vault context second.
+        # System blocks: the identity prompt is stable, so it carries the cache
+        # breakpoint and gets reused across turns. The vault context is living
+        # state we refresh every turn, so it trails *after* the cached identity
+        # block and is left uncached — keeping it fresh without busting the
+        # identity cache prefix (a per-turn-changing cached block would just pay
+        # the cache-write premium for nothing).
         system_blocks = []
         if system:
             system_blocks.append({
@@ -88,7 +97,6 @@ class handler(BaseHTTPRequestHandler):
             system_blocks.append({
                 "type": "text",
                 "text": vault_context,
-                "cache_control": {"type": "ephemeral"},
             })
         if system_blocks:
             kwargs["system"] = system_blocks
