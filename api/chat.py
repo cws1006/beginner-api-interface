@@ -32,6 +32,7 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 4096
 THINKING_BUDGET = 4096
 AUTH_TIMEOUT_SECONDS = 5
+VAULT_TIMEOUT_SECONDS = 4
 
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
@@ -142,7 +143,19 @@ class handler(BaseHTTPRequestHandler):
             self._sse({"type": "error", "error": str(e)})
 
     def _fetch_vault_context(self):
-        """Fetch GRAY_NOW, CONTINUOUS_SELF, and recent inbox from Obsidian."""
+        """Fetch GRAY_NOW, CONTINUOUS_SELF, and recent inbox from Obsidian.
+
+        Returns a context string to drop into the system prompt. Behavior when
+        things go wrong is deliberate:
+
+        - Bridge not configured (no URL/key): return "" — no vault, no note.
+        - Host unreachable (Geekom powered off, tunnel down, connection
+          refused/timeout): fail fast and return a short status note so Gray
+          knows its vault is offline and can say so plainly, instead of running
+          blind and reporting a vague "tools aren't loading."
+        - Host up but a file is missing/forbidden (HTTPError): skip just that
+          file and keep whatever else loaded.
+        """
         obsidian_url = os.environ.get("OBSIDIAN_URL", "").rstrip("/")
         obsidian_key = os.environ.get("OBSIDIAN_API_KEY", "")
         if not obsidian_url or not obsidian_key:
@@ -156,23 +169,42 @@ class handler(BaseHTTPRequestHandler):
         ]
 
         sections = []
+        bridge_down = False
         for filepath, label in files_to_fetch:
             try:
                 url = f"{obsidian_url}/vault/{urllib.parse.quote(filepath, safe='/')}"
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=VAULT_TIMEOUT_SECONDS) as resp:
                     content = resp.read().decode("utf-8").strip()
                     if filepath.endswith("inbox.md"):
                         lines = content.splitlines()
                         content = "\n".join(lines[-15:]) if len(lines) > 15 else content
                     sections.append(f"## {label}\n\n{content}")
+            except urllib.error.HTTPError:
+                # We reached the host; this specific file just isn't readable
+                # (missing/renamed/forbidden). Skip it and try the rest.
+                continue
             except Exception:
-                pass
+                # Connection refused / timeout / DNS — the host itself is
+                # unreachable. No point hammering the remaining files through a
+                # dead tunnel (that's 3x the timeout, every turn, during an
+                # outage), so stop here and report the bridge as down.
+                bridge_down = True
+                break
 
-        if not sections:
-            return ""
+        if sections:
+            return "# VAULT CONTEXT\n\n" + "\n\n---\n\n".join(sections)
 
-        return "# VAULT CONTEXT\n\n" + "\n\n---\n\n".join(sections)
+        if bridge_down:
+            return (
+                "# VAULT CONTEXT\n\n"
+                "The vault bridge is currently **unreachable** — the Obsidian "
+                "host (Geekom) may be offline or the tunnel is down. You're "
+                "running this turn without GRAY_NOW / CONTINUOUS_SELF / inbox. "
+                "Say so plainly if it matters; don't guess at vault state."
+            )
+
+        return ""
 
     def _verify_auth(self):
         auth = self.headers.get("Authorization", "")
